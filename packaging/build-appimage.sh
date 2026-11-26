@@ -31,12 +31,19 @@ echo "== Python, GTK 4 and libadwaita"
 # what is bundled, with each package's own license texts (conda-meta is trimmed away below)
 mkdir -p "$U/share/licenses"
 "$TOOLS/bin/micromamba" list -p "$U" > "$U/share/licenses/packages.txt"
-for meta in "$U"/conda-meta/*.json; do
-    package="$(basename "$meta" .json)"
-    if [ -d "$MAMBA_ROOT_PREFIX/pkgs/$package/info/licenses" ]; then
-        cp -r "$MAMBA_ROOT_PREFIX/pkgs/$package/info/licenses" "$U/share/licenses/$package"
-    fi
-done
+# (searched for: the layout of micromamba's package cache differs between its versions)
+copied=0
+while IFS= read -r dir; do
+    package="$(basename "${dir%/info/licenses}")"
+    mkdir -p "$U/share/licenses/$package"
+    cp -r "$dir/." "$U/share/licenses/$package/"
+    copied=$((copied + 1))
+done < <(find "$MAMBA_ROOT_PREFIX" -type d -path '*/info/licenses')
+echo "license texts of $copied packages"
+if [ "$copied" -lt 50 ]; then
+    echo "the bundled packages' license texts were not found" >&2
+    exit 1
+fi
 
 echo "== Trim"
 rm -rf "$U"/{conda-meta,include,man,ssl,compiler_compat} \
