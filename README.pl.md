@@ -7,7 +7,7 @@ Narzędzie do ćwiczenia w stylu SilkySouls dla Bloodborne na
 ## Instalacja
 ### AppImage (najprościej)
 Pobierz `bb-trainer-…-x86_64.AppImage` z
-[Releases](https://github.com/Konomi12/bb-trainer/releases). Ma w środku własnego Pythona,
+[Releases](https://github.com/Konomi12/bloodborne-trainer/releases). Ma w środku własnego Pythona,
 GTK 4 i libadwaita, więc nie trzeba ich instalować. Potem:
 
 ```bash

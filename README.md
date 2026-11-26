@@ -24,7 +24,7 @@ Deck and the folder package are **untested**; reports are welcome.
 ## Install
 ### AppImage (easiest)
 Download `bb-trainer-…-x86_64.AppImage` from
-[Releases](https://github.com/Konomi12/bb-trainer/releases). It has its own Python, GTK 4 and
+[Releases](https://github.com/Konomi12/bloodborne-trainer/releases). It has its own Python, GTK 4 and
 libadwaita, so the packages above are not needed. Then:
 
 ```bash

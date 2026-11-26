@@ -28,6 +28,15 @@ echo "== Python, GTK 4 and libadwaita"
 "$TOOLS/bin/micromamba" create -y -p "$U" -c conda-forge --override-channels \
     python=3.12 pygobject gtk4 'libadwaita>=1.5' librsvg gdk-pixbuf adwaita-icon-theme
 "$TOOLS/bin/micromamba" list -p "$U" | grep -E '^ *(python|pygobject|gtk4|libadwaita|glib) '
+# what is bundled, with each package's own license texts (conda-meta is trimmed away below)
+mkdir -p "$U/share/licenses"
+"$TOOLS/bin/micromamba" list -p "$U" > "$U/share/licenses/packages.txt"
+for meta in "$U"/conda-meta/*.json; do
+    package="$(basename "$meta" .json)"
+    if [ -d "$MAMBA_ROOT_PREFIX/pkgs/$package/info/licenses" ]; then
+        cp -r "$MAMBA_ROOT_PREFIX/pkgs/$package/info/licenses" "$U/share/licenses/$package"
+    fi
+done
 
 echo "== Trim"
 rm -rf "$U"/{conda-meta,include,man,ssl,compiler_compat} \
@@ -54,7 +63,7 @@ grep -q svg "$LOADERS/loaders.cache.in" || { echo "no SVG loader for gdk-pixbuf"
 
 echo "== Trainer"
 mkdir -p "$U/share/bb-trainer"
-cp "$ROOT"/*.py "$ROOT"/stub.s "$ROOT"/README*.md "$U/share/bb-trainer/"
+cp "$ROOT"/*.py "$ROOT"/stub.s "$ROOT"/README*.md "$ROOT"/LICENSE "$U/share/bb-trainer/"
 install -m 755 "$ROOT/packaging/AppRun" "$APPDIR/AppRun"
 cp "$ROOT/packaging/bb-trainer.desktop" "$ROOT/packaging/bb-trainer.svg" "$APPDIR/"
 ln -s bb-trainer.svg "$APPDIR/.DirIcon"
