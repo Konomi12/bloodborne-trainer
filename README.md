@@ -22,6 +22,21 @@ Tested on CachyOS with bbport 0.7 (AppImage and source). Other distributions, St
 Deck and the folder package are **untested**; reports are welcome.
 
 ## Install
+### AppImage (easiest)
+Download `bb-trainer-…-x86_64.AppImage` from
+[Releases](https://github.com/Konomi12/bloodborne-trainer/releases). It has its own Python, GTK 4 and
+libadwaita, so the packages above are not needed. Then:
+
+```bash
+chmod +x bb-trainer-*-x86_64.AppImage
+./bb-trainer-*-x86_64.AppImage --install
+```
+
+`--install` adds it to the application menu (`--install --desktop` also to the desktop,
+`--uninstall` removes both); you can also just run the file. It draws in software; if you want
+the GPU, start it with `BB_TRAINER_GL=1`.
+
+### From source
 Download or clone this repository to a place where it can stay, then in its folder:
 
 ```bash

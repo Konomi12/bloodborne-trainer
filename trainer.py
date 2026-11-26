@@ -739,7 +739,8 @@ class Window(Adw.ApplicationWindow):
         try:
             with open(GAME_LOG, "wb") as log:
                 self.child = subprocess.Popen(install.command(), stdout=log,
-                                              stderr=subprocess.STDOUT, start_new_session=True)
+                                              stderr=subprocess.STDOUT, start_new_session=True,
+                                              env=bbport.child_env())
         except OSError as error:
             self.alert(tr("Could not start the game"), str(error))
             return
