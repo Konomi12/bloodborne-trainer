@@ -7,7 +7,7 @@ U="$HERE/usr"
 
 # Variables changed below. The originals are kept so the game starts with the user's own
 # environment (see bbport.child_env).
-VARS="LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE GI_TYPELIB_PATH XDG_DATA_DIRS GSETTINGS_SCHEMA_DIR GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR FONTCONFIG_FILE GDK_DISABLE"
+VARS="LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE GI_TYPELIB_PATH XDG_DATA_DIRS GSETTINGS_SCHEMA_DIR GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR FONTCONFIG_FILE XKB_CONFIG_ROOT XLOCALEDIR GDK_DISABLE"
 for v in $VARS; do
     eval "if [ -n \"\${$v+x}\" ]; then export BB_TRAINER_SAVED_$v=\"\$$v\"; fi"
 done
@@ -43,6 +43,9 @@ export GSETTINGS_SCHEMA_DIR="$U/share/glib-2.0/schemas"
 export GDK_PIXBUF_MODULEDIR="$U/lib/gdk-pixbuf-2.0/2.10.0/loaders"
 export GDK_PIXBUF_MODULE_FILE="$RUN/loaders.cache"
 export FONTCONFIG_FILE="$RUN/fonts.conf"
+# Keyboard layouts and compose tables: the libraries only know the paths of the build machine
+export XKB_CONFIG_ROOT="$U/share/xkeyboard-config-2"
+export XLOCALEDIR="$U/share/X11/locale"
 # Software rendering: the bundled libraries never meet the system's GPU drivers.
 # BB_TRAINER_GL=1 turns OpenGL/Vulkan back on.
 if [ -z "$BB_TRAINER_GL" ]; then
