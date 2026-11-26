@@ -1,19 +1,17 @@
-"""Listy lamp i przedmiotów czytane z plików gry użytkownika (DCX / BND4 / FMG / EMEVD)."""
+"""Lamp and item lists read from the user's game files (DCX / BND4 / FMG / PARAM / EMEVD)."""
 import glob
-import json
 import math
-import os
+import re
 import struct
 import zlib
 from pathlib import Path
 
-LAUNCHER_CONFIG = Path.home() / ".config/bbport-launcher"
-BBPORT = Path.home() / "bbport"
+import bbport
+from i18n import tr
 
-# (flaga pokonania, nazwa, wejście)
-# Wejście z plików map (MSB): (mapa, punkt bramy mgły, punkt po wewnętrznej stronie, odstęp).
-# Trainer stawia gracza `odstęp` metrów przed bramą, twarzą do areny. None: walka zaczyna się
-# od rozmowy we Śnie, więc wystarczy lampa.
+# (defeat flag, name, entrance)
+# Entrance, from the map files (MSB): (map, fog gate point, point on its inner side, distance).
+# The trainer puts the player `distance` metres in front of the gate, facing the arena.
 BOSSES = [
     (12411700, "Cleric Beast",
      ("m24_01", (-154.14, -27.02, 35.16), (-123.5, -27.02, 65.7), 2.5)),
@@ -60,57 +58,62 @@ BOSSES = [
     (13601800, "Orphan of Kos",
      ("m36_00", (-700.2, 1580.5, -906.2), (-700.2, 1578.54, -929.2), 2.5)),
 ]
-# Bossowie, którzy istnieją dopiero w danym momencie fabuły: flagi, które trzeba ustawić przed
-# wczytaniem Snu (ze skryptów m21_00 gry). 9462 = Sen po Mergo's Wet Nurse; 12411000 usuwa
-# Gehrmana, gdy ustawiona; 12101802 / 12101852 = walka już rozpoczęta (wchodzi się przez mgłę).
+# Bosses that only exist at a certain point of the story: the flags to set before loading the
+# Dream (from the game's m21_00 scripts). 9462 = the Dream after Mergo's Wet Nurse; 12411000
+# removes Gehrman when set; 12101802 / 12101852 = fight already started (entered through fog).
 STORY_FIGHTS = {
     12101800: {9462: True, 12411000: False, 12101800: False, 12101802: True,
                12101850: False, 12101852: False},
-    # 9900 (trzy pępowiny) musi być ustawiona: bez niej gra uznaje martwego Gehrmana za
-    # koniec („Honoring Wishes”) i od razu puszcza napisy i NG+.
+    # 9900 (three umbilical cords) must be set: without it the game takes a dead Gehrman for
+    # an ending ("Honoring Wishes") and rolls the credits and NG+ right away.
     12101850: {9462: True, 12411000: False, 9900: True, 12101800: True, 12101802: True,
                12101850: False, 12101852: True},
 }
 
 
 def map_id(name):
-    """"m24_01" -> spakowany numer mapy gry."""
+    """"m24_01" -> the game's packed map number."""
     return int(name[1:3]) << 24 | int(name[4:6]) << 16
 
 
 def boss_entry(entry):
-    """(mapa, pozycja przed bramą, kąt patrzenia w stronę areny)."""
+    """(map, position in front of the gate, yaw facing the arena)."""
     name, gate, inside, back = entry
     dx, dz = inside[0] - gate[0], inside[2] - gate[2]
     length = math.hypot(dx, dz)
     dx, dz = dx / length, dz / length
     position = [gate[0] - dx * back, gate[1] + 0.8, gate[2] - dz * back]
-    return map_id(name), position, math.atan2(-dx, -dz)  # w grze przód to -(sin, cos)
+    return map_id(name), position, math.atan2(-dx, -dz)  # forward in game is -(sin, cos)
+
+
+def has_map(game, name):
+    """Whether the game files contain a map (The Old Hunters maps need the DLC)."""
+    return (game / f"dvdroot_ps4/map/mapstudio/{name}_00_00.msb.dcx").is_file()
+
+
+def bosses():
+    """The bosses whose maps this copy of the game has (all of them if it cannot be told)."""
+    try:
+        game = settings()[0]
+    except FileNotFoundError:
+        return BOSSES
+    return [boss for boss in BOSSES if has_map(game, boss[2][0])] or BOSSES
 
 
 def settings():
-    """(folder gry, kod języka tekstów) z ustawień bbport."""
-    game = Path.home() / "bloodborne/CUSA03173"
-    for config in LAUNCHER_CONFIG.glob("*.json"):
-        try:
-            value = json.loads(config.read_text()).get("game_dir")
-        except (OSError, ValueError, AttributeError):
-            continue
-        if value and os.path.isdir(value):
-            game = Path(value)
-            break
-    language = "engus"
-    for ini in (BBPORT / "bbport.ini", Path.home() / ".local/share/bbport/bbport.ini"):
-        try:
-            for line in ini.read_text().splitlines():
-                if line.startswith("game_text_language="):
-                    language = line.split("=", 1)[1].strip()
-        except OSError:
-            continue
-        break
-    if not (game / "dvdroot_ps4/msg" / language).is_dir():
-        language = "engus"
-    return game, language
+    """(game folder, text language code) according to the bbport settings."""
+    install = bbport.find()
+    game = bbport.game_dir(install)
+    if not game or not (game / "dvdroot_ps4").is_dir():
+        raise FileNotFoundError(tr("Game files not found. Choose the game folder in the bbport "
+                                   "launcher, then restart the trainer."))
+    messages = game / "dvdroot_ps4/msg"
+    wanted = [bbport.ini_value(install, "game_text_language"), "engus", "enggb"]
+    wanted += sorted(p.name for p in messages.glob("*"))
+    for language in wanted:
+        if language and (messages / language / "item.msgbnd.dcx").is_file():
+            return game, language
+    raise FileNotFoundError(tr("No game texts found in {}").format(messages))
 
 
 def _dcx(path):
@@ -131,7 +134,7 @@ def _utf16(data, offset):
 
 def _bnd4(data):
     if data[:4] != b"BND4":
-        raise ValueError("to nie BND4")
+        raise ValueError("not a BND4 file")
     count = struct.unpack_from("<i", data, 12)[0]
     header = struct.unpack_from("<q", data, 32)[0]
     files = {}
@@ -168,28 +171,173 @@ def _texts(game, language, bundle, table):
 
 
 def lamps():
-    """[(punkt, nazwa)] wszystkich lamp, z nazwami w języku gry."""
+    """[(point, name)] of every lamp, named in the game's language."""
     game, language = settings()
     names = _texts(game, language, "menu", "イベントテキスト")
     found = {2102961: names.get(70002100, "Hunter's Dream")}
     for path in glob.glob(str(game / "dvdroot_ps4/event/m*.emevd.dcx")):
         data = _dcx(path)
-        needle = struct.pack("<i", 7000)  # wspólne zdarzenie 7000 = lampa
+        needle = struct.pack("<i", 7000)  # common event 7000 = a lamp
         at = data.find(needle)
         while at >= 4:
             if at + 16 <= len(data):
                 _, _, flag, entity, _ = struct.unpack_from("<5i", data, at - 4)
                 if 2000000 < flag < 4000000 and entity - flag == 1000:
                     ident = 70000000 + entity // 100000 * 100 + entity // 10000 % 10 * 10 + entity % 10
-                    found[entity + 1000] = names.get(ident, f"Lampa {entity + 1000}")
+                    found[entity + 1000] = names.get(ident,
+                                                     tr("Lamp {}").format(entity + 1000))
             at = data.find(needle, at + 4)
     return sorted(found.items())
 
 
-def goods():
-    """[(id, nazwa)] przedmiotów zwykłych."""
+# ---------------------------------------------------------------- game parameters
+_SIZES = {"s8": 1, "u8": 1, "dummy8": 1, "s16": 2, "u16": 2, "s32": 4, "u32": 4, "f32": 4,
+          "fixstr": 1, "fixstrW": 2}
+_FORMATS = {"s8": "b", "u8": "B", "s16": "h", "u16": "H", "s32": "i", "u32": "I", "f32": "f"}
+
+
+def _layout(paramdef):
+    """{field: (offset, type, first bit, bit count)} from a parameter definition."""
+    count, size = struct.unpack_from("<HH", paramdef, 8)
+    offset = used = unit = 0
+    fields = {}
+    for i in range(count):
+        record = paramdef[0x38 + i * size:0x38 + (i + 1) * size]
+        kind = record[64:72].split(b"\0")[0].decode()
+        name = record[144:176].split(b"\0")[0].decode().strip()
+        width, length, bits = _SIZES[kind], 1, 0
+        if "[" in name:
+            name, rest = name[:-1].split("[")
+            length = int(rest)
+        if ":" in name:
+            name, rest = name.split(":")
+            bits = int(rest)
+        if bits:
+            if not used or used + bits > unit * 8 or unit != width:
+                offset += unit if used else 0
+                used, unit = 0, width
+            fields[name] = (offset, kind, used, bits)
+            used += bits
+            if used == unit * 8:
+                offset, used = offset + unit, 0
+        else:
+            if used:
+                offset, used = offset + unit, 0
+            fields[name] = (offset, kind, 0, 0)
+            offset += width * length
+    return fields
+
+
+def _params(game, name):
+    """{id: {field: value}} of a parameter table, e.g. "EquipParamGoods"."""
+    folder = game / "dvdroot_ps4"
+    table = _bnd4(_dcx(folder / "param/gameparam/gameparam.parambnd.dcx"))[f"{name}.param"]
+    layout = _layout(_bnd4(_dcx(folder / "paramdef/paramdef.paramdefbnd.dcx"))[f"{name}.paramdef"])
+
+    def row(start):
+        values = {}
+        for field, (offset, kind, bit, bits) in layout.items():
+            if kind not in _FORMATS:
+                continue
+            value = struct.unpack_from("<" + _FORMATS[kind], table, start + offset)[0]
+            values[field] = value >> bit & (1 << bits) - 1 if bits else value
+        return values
+
+    result = {}
+    for i in range(struct.unpack_from("<H", table, 0x0A)[0]):
+        ident, _, start, _ = struct.unpack_from("<IIqq", table, 0x40 + i * 24)
+        result[ident] = row(start)
+    return result
+
+
+# ---------------------------------------------------------------- items
+def _item_names(game, language, table):
+    names = _texts(game, language, "item", table)
+    return {i: n.strip() for i, n in names.items()
+            if n and n.strip() and not n.strip().startswith(("(", "<", "[", "%", "*", "?"))
+            and n.strip() != "NOT NEEDED" and not re.fullmatch(r"[a-z]{2}\d+", n.strip())}
+
+
+# Variant and group names are translated on screen.
+WEAPON_VARIANTS = (("Normal", 0), ("Uncanny", 10000), ("Lost", 20000))
+WEAPON_GROUPS = ("Weapons (right hand)", "Firearms, shields and torches (left hand)")
+ARMOR_GROUPS = (("headEquip", "Attire: head"), ("bodyEquip", "Attire: chest"),
+                ("armEquip", "Attire: arms"), ("legEquip", "Attire: legs"))
+GOODS_GROUPS = ("Healing and bullets", "Throwables and buffs", "Hunter tools",
+                "Upgrade and ritual materials", "Echoes and insight", "Chalices",
+                "Keys and story items (careful)", "Bells and miscellaneous", "Gestures",
+                "Other (may not work)")
+
+
+def _goods_group(row):
+    kind, order = row["goodsType"], row["sortId"]
+    if kind == 1:
+        return GOODS_GROUPS[6]
+    if kind == 2:
+        return GOODS_GROUPS[3]
+    if kind == 6:
+        return GOODS_GROUPS[5]
+    # the game orders the rest by sortId: consecutive ranges are consecutive kinds
+    if order >= 500000:
+        return GOODS_GROUPS[8]
+    if order >= 240000:
+        return GOODS_GROUPS[7]
+    if order >= 220000 or 90000 <= order < 100000:
+        return GOODS_GROUPS[2]
+    if order >= 120000:
+        return GOODS_GROUPS[9]
+    if order >= 100000:
+        return GOODS_GROUPS[4]
+    if order >= 30000:
+        return GOODS_GROUPS[1]
+    return GOODS_GROUPS[0]
+
+
+def catalog():
+    """[(group name, [item])] in the order the game lists them.
+
+    An item: {"kind": "weapon" | "armor" | "goods", "id", "name"}; weapons also have "levels":
+    {variant offset: {upgrade level: id}}.
+    """
     game, language = settings()
-    names = _texts(game, language, "item", "アイテム名")
-    return sorted(((i, n.strip()) for i, n in names.items()
-                   if n and n.strip() and not n.strip().startswith(("(", "<", "[", "%", "*", "?"))),
-                  key=lambda item: item[1].casefold())
+    groups = {}
+
+    def put(group, order, item):
+        groups.setdefault(group, []).append((order, item["name"], item))
+
+    names = _item_names(game, language, "武器名")
+    rows = _params(game, "EquipParamWeapon")
+    for ident, name in names.items():
+        if ident % 100000 or ident not in rows or ident == 1000000:  # 1000000: bare fists
+            continue
+        levels = {}
+        for _, offset in WEAPON_VARIANTS:
+            found = {level: ident + offset + level * 100 for level in range(11)
+                     if ident + offset + level * 100 in rows
+                     and ident + offset + level * 100 in names}
+            if found:
+                levels[offset] = found
+        group = WEAPON_GROUPS[0 if rows[ident]["rightHandEquipable"] else 1]
+        put(group, rows[ident]["sortId"],
+            {"kind": "weapon", "id": ident, "name": name, "levels": levels})
+
+    names = _item_names(game, language, "防具名")
+    rows = _params(game, "EquipParamProtector")
+    for ident, name in names.items():
+        if ident not in rows:
+            continue
+        for field, group in ARMOR_GROUPS:
+            if rows[ident][field]:
+                put(group, rows[ident]["sortId"], {"kind": "armor", "id": ident, "name": name})
+                break
+
+    names = _item_names(game, language, "アイテム名")
+    rows = _params(game, "EquipParamGoods")
+    for ident, name in names.items():
+        if ident in rows:
+            put(_goods_group(rows[ident]), rows[ident]["sortId"],
+                {"kind": "goods", "id": ident, "name": name})
+
+    order = (*WEAPON_GROUPS, *(group for _, group in ARMOR_GROUPS), *GOODS_GROUPS)
+    return [(group, [item for _, _, item in sorted(groups[group], key=lambda e: e[:2])])
+            for group in order if group in groups]

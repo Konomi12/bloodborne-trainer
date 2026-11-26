@@ -1,40 +1,50 @@
-"""Silnik trainera: pamięć gry (bbport, Bloodborne 1.09) przez /proc/<pid>/mem.
+"""Trainer engine: the game's memory (bbport, Bloodborne 1.09) through /proc/<pid>/mem.
 
-Wszystkie adresy to przesunięcia w obrazie gry załadowanym pod 0x800000000. Funkcje gry
-wywołuje krótka wstawka w głównej pętli (stub.s): raz na klatkę czyta skrzynkę w pamięci gry,
-skaluje krok czasu i wykonuje jedno zlecone wywołanie na wątku gry.
+All addresses are offsets into the game image loaded at 0x800000000. Game functions are called
+by a short stub in the main loop (stub.s): once per frame it reads a mailbox in game memory,
+scales the time step and runs one requested call on the game's own thread.
 """
 import ctypes
 import math
 import os
 import signal
 import struct
-import subprocess
 import time
+
+from i18n import tr
 
 BASE = 0x800000000
 
-# Globalne wskaźniki
+# Global pointers
 WORLD_CHR_MAN = 0x553E878
 GAME_DATA_MAN = 0x553B130
-GAME_STATE = 0x5556678          # +0x08: trwa wczytywanie
+GAME_STATE = 0x5556678          # +0x08: loading in progress
 EVENT_STATE = 0x553B0D8
 EVENT_FLAG_MAN = 0x553B100
 EVENT_MAN = 0x553B108
 MAP_LIST = 0x553B148
 
-# Funkcje gry
+# Game functions
 FN_SET_HP = 0x18BCD40           # (chr, hp)
-FN_SELECT_SPAWN = 0x1332BC0     # (_, -1): mapa wg „ostatniej lampy” [GameState+0x1528]
-FN_RELOAD = 0x13CDE30           # przeładowanie do wybranego miejsca
-FN_SET_FLAG = 0x132E5A0         # (_, flaga, wartość)
-FN_GET_FLAG = 0x1399BF0         # (_, flaga) -> bool
-FN_SAVE_REQUEST = 0x1336DA0     # zapis gry przed wyjściem
-FN_RETURN_TITLE = 0x138BAF0     # OnReturnTitle: powrót do menu głównego
-FN_ITEM_FITS = 0x14D9A80        # (ekwipunek, &kod, ile) -> ile wejdzie
-FN_ITEM_ADD = 0x14DA0A0         # (ekwipunek, &klucz, ile) -> slot
+FN_SELECT_SPAWN = 0x1332BC0     # (_, -1): map of the "last lamp" [GameState+0x1528]
+FN_RELOAD = 0x13CDE30           # reload into the selected place
+FN_SET_FLAG = 0x132E5A0         # (_, flag, value)
+FN_GET_FLAG = 0x1399BF0         # (_, flag) -> bool
+FN_SAVE_REQUEST = 0x1336DA0     # save the game before leaving
+FN_RETURN_TITLE = 0x138BAF0     # OnReturnTitle: back to the main menu
+FN_ITEM_FITS = 0x14D9A80        # (inventory, &code, count) -> how many fit
+FN_ITEM_ADD = 0x14DA0A0         # (inventory, &key, count) -> slot
+FN_GIVE_ANY = 0x14CDA70         # (equipment, _, &holder, count, _, 1, 0) -> slot (<0: refused)
+FN_NEW_WEAPON = 0x1A87260       # (&holder, item manager, id): a new weapon instance
+FN_NEW_ARMOR = 0x1A87390        # the same for armor
+FN_RELEASE_ITEM = 0x1A8BC00     # (&holder): drops our reference
+ITEM_MAN = 0x553E990
+ITEM_POPUP_MAN = 0x553B1C0
+DAMAGE_MAN = 0x553D740          # +0x30: the game draws attack shapes ("デバッグ球表示")
+FN_ITEM_POPUP = 0x16D8850       # (queue, &holder, category, id, count, 0): "item acquired" box
+CATEGORY_WEAPON, CATEGORY_ARMOR, CATEGORY_GOODS = 0, 1, 4
 
-# Flagi debugowe gry (nazwy z jej własnego menu debugowego)
+# The game's debug flags (names from its own debug menu)
 FLAGS = {
     "no_dead": 0x553E888,
     "one_hit": 0x553E889,
@@ -50,25 +60,25 @@ FLAGS = {
     "all_no_ai": 0x553E895,
 }
 
-STATS = {  # przesunięcia w danych postaci [[GameDataMan]+8]
-    "Witalność": 0x40, "Wytrzymałość": 0x48, "Siła": 0x58, "Zręczność": 0x60,
-    "Skażenie krwi": 0x68, "Wiedza tajemna": 0x70, "Poziom": 0x90,
-    "Wgląd": 0x84, "Echa krwi": 0x94,
+STATS = {  # offsets in the character data [[GameDataMan]+8]; the names are translated on screen
+    "Vitality": 0x40, "Endurance": 0x48, "Strength": 0x58, "Skill": 0x60,
+    "Bloodtinge": 0x68, "Arcane": 0x70, "Level": 0x90,
+    "Insight": 0x84, "Blood echoes": 0x94,
 }
-NG_CYCLE = 0x68                 # w GameDataMan
+NG_CYCLE = 0x68                 # in GameDataMan
 
 HOOK_SITE = 0x2018E3D
 HOOK_ORIGINAL = bytes.fromhex("488d05cc765203")  # lea rax,[rip+0x35276cc]
-CAVE = 0x50D9800                # dopełnienie za kodem gry
-MAILBOX = 0x56D3800             # dopełnienie za .bss gry
+CAVE = 0x50D9800                # padding after the game's code
+MAILBOX = 0x56D3800             # padding after the game's .bss
 MAGIC = b"BBTRAIN1"
 
-# stub.s po złożeniu (adres skrzynki i powrotu wpisane na stałe)
+# Assembled stub.s (the mailbox and return addresses are hard-coded)
 STUB = bytes.fromhex(
     "49bb00386d050800000049ff4358c5fa1045c8c4c17a594308c5fa1145c8418b430c413b4310"
-    "7442534154415541564189c44d89dd4889e34883e4f0498b7d20498b7528498b5530498b4d38"
-    "4d8b45404d8b4d4841ff551849894550458965104889dc415e415d415c5b48b8100554050800"
-    "000049bb448e01020800000041ffe3")
+    "744e534154415541564189c44d89dd4889e34883e4f04883ec10498b456048890424498b7d20"
+    "498b7528498b5530498b4d384d8b45404d8b4d4841ff551849894550458965104889dc415e41"
+    "5d415c5b48b8100554050800000049bb448e01020800000041ffe3")
 
 
 class TrainerError(Exception):
@@ -76,8 +86,43 @@ class TrainerError(Exception):
 
 
 def become_subreaper():
-    """Potomkowie osieroceni przez launcher zostają przy nas (Yama pozwala czytać potomków)."""
+    """Processes orphaned by the launcher stay ours (Yama lets us read our descendants)."""
     ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)
+
+
+def ptrace_scope():
+    """The Yama ptrace policy: 0 or 1 work with the trainer, 2 and 3 block it."""
+    try:
+        with open("/proc/sys/kernel/yama/ptrace_scope") as f:
+            return int(f.read())
+    except (OSError, ValueError):
+        return 0
+
+
+def elf_symbol(path, name):
+    """Address of an exported symbol inside a 64-bit ELF shared library, or 0."""
+    with open(path, "rb") as f:
+        header = f.read(64)
+        if header[:6] != b"\x7fELF\x02\x01":
+            return 0
+        offset = struct.unpack_from("<Q", header, 0x28)[0]
+        size, count = struct.unpack_from("<HH", header, 0x3A)
+        f.seek(offset)
+        table = f.read(size * count)
+        sections = [struct.unpack_from("<IIQQQQIIQQ", table, i * size) for i in range(count)]
+        for section in sections:
+            if section[1] != 11:    # SHT_DYNSYM
+                continue
+            strings = sections[section[6]]
+            f.seek(strings[4])
+            names = f.read(strings[5])
+            f.seek(section[4])
+            symbols = f.read(section[5])
+            wanted = name.encode() + b"\0"
+            for start, _, _, defined, value, _ in struct.iter_unpack("<IBBHQQ", symbols):
+                if defined and names[start:start + len(wanted)] == wanted:
+                    return value
+    return 0
 
 
 def find_game_pids():
@@ -104,22 +149,24 @@ class Game:
         self.fd = None
         self.hooked = False
         self.keyboard_ptr = 0
-        self.forced = set()     # flagi włączone przez trainer (tylko te potem gasi)
+        self.keyboard_missing = False
+        self.forced = set()     # flags the trainer turned on (it only turns these off again)
+        self.hitboxes = False   # whether the trainer turned hitbox drawing on
 
-    # ---------------------------------------------------------------- połączenie
+    # ---------------------------------------------------------------- connection
     @property
     def attached(self):
         return self.fd is not None
 
     def attach(self):
-        """Łączy się z działającą grą. Zwraca opis stanu dla użytkownika."""
+        """Connects to the running game. Returns a status line for the user."""
         if self.attached:
             if self.pid in find_game_pids():
                 return self._ensure_hook()
             self.detach(restore=False)
         pids = find_game_pids()
         if not pids:
-            return "Gra nie jest uruchomiona."
+            return tr("The game is not running.")
         for pid in pids:
             try:
                 fd = os.open(f"/proc/{pid}/mem", os.O_RDWR)
@@ -127,12 +174,15 @@ class Game:
                     os.close(fd)
                     continue
             except PermissionError:
-                return "Brak dostępu do gry. Zamknij ją i uruchom przyciskiem w trainerze."
+                if ptrace_scope() >= 2:
+                    return tr("Your system blocks access to game memory (ptrace_scope). "
+                              "See the README.")
+                return tr("No access to the game. Close it and start it from the trainer.")
             except OSError:
                 continue
             self.pid, self.fd = pid, fd
             return self._ensure_hook()
-        return "Gra się uruchamia…"
+        return tr("The game is starting…")
 
     def detach(self, restore=True):
         if self.fd is not None:
@@ -148,21 +198,23 @@ class Game:
         self.fd = self.pid = None
         self.hooked = False
         self.keyboard_ptr = 0
+        self.keyboard_missing = False
         self.forced.clear()
+        self.hitboxes = False
 
     def _ensure_hook(self):
         if self.hooked:
-            return "Połączono."
+            return tr("Connected.")
         if not self.ptr(BASE + GAME_DATA_MAN):
-            return "Czekam, aż gra wystartuje…"
+            return tr("Waiting for the game to start…")
         site = self.read(BASE + HOOK_SITE, 7)
         if site != HOOK_ORIGINAL:
-            return "To nie jest oczekiwana wersja gry (potrzebna 1.09): nie ruszam jej."
+            return tr("Unexpected game version (1.09 is required): leaving it alone.")
         cave = self.read(BASE + CAVE, len(STUB))
         box = self.read(BASE + MAILBOX, 0x100)
         if cave is None or box is None or cave.strip(b"\0") not in (b"", STUB.strip(b"\0")) \
                 or (box.strip(b"\0") and not box.startswith(MAGIC)):
-            return "Miejsce na wstawkę trainera jest zajęte: nie ruszam gry."
+            return tr("The space for the trainer's stub is taken: leaving the game alone.")
         fresh = bytearray(0x100)
         fresh[0:8] = MAGIC
         struct.pack_into("<f", fresh, 8, 1.0)
@@ -171,7 +223,7 @@ class Game:
         rel = (BASE + CAVE) - (BASE + HOOK_SITE + 5)
         self._patch_stopped(BASE + HOOK_SITE, b"\xe9" + struct.pack("<i", rel) + b"\x90\x90")
         self.hooked = True
-        return "Połączono."
+        return tr("Connected.")
 
     def _patch_stopped(self, address, data):
         os.kill(self.pid, signal.SIGSTOP)
@@ -193,14 +245,16 @@ class Game:
             os.kill(self.pid, signal.SIGCONT)
 
     def restore(self):
-        """Wyłącza wszystko, co trainer włączył, i oddaje grze oryginalny kod."""
+        """Turns off everything the trainer turned on and gives the game its own code back."""
         for name in list(self.forced):
             self.set_flag(name, False)
+        if self.hitboxes:
+            self.set_hitboxes(False)
         if self.hooked:
             self._patch_stopped(BASE + HOOK_SITE, HOOK_ORIGINAL)
             self.hooked = False
 
-    # ---------------------------------------------------------------- pamięć
+    # ---------------------------------------------------------------- memory
     def read(self, address, size):
         if self.fd is None or not 0x10000 <= address < 0x7FFFFFFFFFFF:
             return None
@@ -212,9 +266,9 @@ class Game:
 
     def write(self, address, data):
         if self.fd is None or not 0x10000 <= address < 0x7FFFFFFFFFFF:
-            raise TrainerError("zły adres")
+            raise TrainerError(tr("bad address"))
         if os.pwrite(self.fd, data, address) != len(data):
-            raise TrainerError("zapis do gry się nie udał")
+            raise TrainerError(tr("writing to the game failed"))
 
     def unpack(self, address, fmt):
         data = self.read(address, struct.calcsize(fmt))
@@ -239,7 +293,7 @@ class Game:
     def set_i32(self, address, value):
         self.write(address, struct.pack("<i", int(value)))
 
-    # ---------------------------------------------------------------- stan gry
+    # ---------------------------------------------------------------- game state
     def player(self):
         return self.chain(BASE + WORLD_CHR_MAN, 0x60)
 
@@ -252,16 +306,16 @@ class Game:
 
     def need_world(self):
         if not self.attached or not self.hooked:
-            raise TrainerError("trainer nie jest połączony z grą")
+            raise TrainerError(tr("the trainer is not connected to the game"))
         if not self.in_world():
-            raise TrainerError("najpierw wczytaj postać")
+            raise TrainerError(tr("load a character first"))
         return self.player()
 
     def chr_data(self, chr_):
         return self.chain(chr_ + 0x3B0, 0x20) if chr_ else 0
 
     def vitals(self, chr_):
-        """(hp, max_hp, stamina, max_stamina) albo None."""
+        """(hp, max_hp, stamina, max_stamina) or None."""
         data = self.chr_data(chr_)
         if not data:
             return None
@@ -270,7 +324,7 @@ class Game:
         return None if None in values else values
 
     def transform(self, chr_):
-        """Blok z pozycją: +0x1D0 obrót, +0x1E0 pozycja."""
+        """The position block: rotation at +0x1D0, position at +0x1E0."""
         return self.chain(chr_ + 0x58, 0x08, 0x3B0, 0x68) if chr_ else 0
 
     def position(self, chr_):
@@ -300,20 +354,21 @@ class Game:
     def game_data(self):
         return self.chain(BASE + GAME_DATA_MAN, 0x08)
 
-    # ---------------------------------------------------------------- wywołania
+    # ---------------------------------------------------------------- calls
     def heartbeat(self):
         return self.unpack(BASE + MAILBOX + 0x58, "<Q")
 
     def call(self, function, *args, timeout=2.0):
-        """Wywołuje funkcję gry na jej głównym wątku i zwraca rax."""
+        """Calls a game function on the game's main thread and returns rax."""
         if not self.hooked:
-            raise TrainerError("trainer nie jest połączony z grą")
+            raise TrainerError(tr("the trainer is not connected to the game"))
         box = BASE + MAILBOX
         seq, ack = struct.unpack("<II", self.read(box + 0x0C, 8))
         if seq != ack:
-            raise TrainerError("gra jeszcze wykonuje poprzednie polecenie")
-        padded = list(args) + [0] * (6 - len(args))
-        self.write(box + 0x18, struct.pack("<7Q", function, *[a & (2**64 - 1) for a in padded]))
+            raise TrainerError(tr("the game is still running the previous command"))
+        padded = [a & (2**64 - 1) for a in args] + [0] * (7 - len(args))
+        self.write(box + 0x18, struct.pack("<7Q", function, *padded[:6]))
+        self.write(box + 0x60, struct.pack("<Q", padded[6]))  # the stack argument
         new = (seq + 1) & 0xFFFFFFFF
         self.write(box + 0x0C, struct.pack("<I", new))
         deadline = time.monotonic() + timeout
@@ -321,19 +376,30 @@ class Game:
             if self.unpack(box + 0x10, "<I") == new:
                 return self.unpack(box + 0x50, "<Q")
             time.sleep(0.003)
-        # Niewykonane polecenie cofamy, żeby nie odpaliło się później z zaskoczenia.
+        # Withdraw a command that did not run, so it cannot fire later by surprise.
         self.write(box + 0x0C, struct.pack("<I", ack))
-        raise TrainerError("gra nie odpowiada (wczytywanie albo pauza okna?)")
+        raise TrainerError(tr("the game is not responding (loading or paused?)"))
 
     def game_call(self, offset, *args):
         if self.read(BASE + offset, 4) != b"\x55\x48\x89\xe5":
-            raise TrainerError(f"funkcja gry {offset:#x} wygląda inaczej niż w 1.09")
+            raise TrainerError(tr("game function {} does not look like 1.09").format(hex(offset)))
         return self.call(BASE + offset, *args)
 
-    # ---------------------------------------------------------------- funkcje
+    # ---------------------------------------------------------------- features
     def set_flag(self, name, on):
         self.write(BASE + FLAGS[name], b"\x01" if on else b"\0")
         self.forced.add(name) if on else self.forced.discard(name)
+
+    def set_hitboxes(self, on):
+        """Drawing of attack shapes. The damage manager only exists in game, so this is called
+        repeatedly; it does nothing when the state already matches."""
+        manager = self.ptr(BASE + DAMAGE_MAN)
+        if not manager:
+            return
+        wanted = b"\x01" if on else b"\0"
+        if self.read(manager + 0x30, 1) not in (wanted, None):
+            self.write(manager + 0x30, wanted)
+        self.hitboxes = on
 
     def set_speed(self, speed):
         if self.hooked:
@@ -358,7 +424,7 @@ class Game:
         player = self.need_world()
         warp = self.ptr(self.ptr(player) + 0x5F8)
         if not BASE < warp < BASE + 0x50DA000:
-            raise TrainerError("nieoczekiwana funkcja teleportu")
+            raise TrainerError(tr("unexpected teleport function"))
         if rotation is None:
             rotation = self.position(player)[1]
         scratch = BASE + MAILBOX + 0x80
@@ -370,7 +436,7 @@ class Game:
             self.write(player + 0x1E4, bytes([flags[0] | 2]))
 
     def warp_lamp(self, point):
-        """Jak podróż lampą w grze: ustawia ostatnią lampę i przeładowuje świat do niej."""
+        """Like lamp travel in game: sets the last lamp and reloads the world there."""
         self.need_world()
         state = self.ptr(BASE + GAME_STATE)
         previous = self.read(state + 0x1528, 4)
@@ -378,12 +444,12 @@ class Game:
         self.set_i32(state + 0x1528, point)
         if not self.game_call(FN_SELECT_SPAWN, 0, 0xFFFFFFFF) & 0xFF:
             self.write(state + 0x1528, previous)
-            raise TrainerError("gra odrzuciła ten warp")
+            raise TrainerError(tr("the game refused this warp"))
         self.game_call(FN_RELOAD)
 
     def warp_position(self, map_id, position, yaw):
-        """Przeładowuje świat od razu w podanym miejscu (wymuszone miejsce przywołania gry).
-        Ostatnia lampa się nie zmienia. Po wczytaniu trzeba wywołać clear_forced_spawn()."""
+        """Reloads the world straight at a given spot (the game's forced spawn point).
+        The last lamp stays. Call clear_forced_spawn() once loading is done."""
         self.need_world()
         state = self.ptr(BASE + GAME_STATE)
         spot = struct.pack("<4f", *position[:3], 1.0)
@@ -395,11 +461,11 @@ class Game:
         if not self.game_call(FN_SELECT_SPAWN, 0, 0xFFFFFFFF) & 0xFF \
                 or self.unpack(state + 0x0C, "<I") != map_id:
             self.clear_forced_spawn()
-            raise TrainerError("gra odrzuciła ten warp")
+            raise TrainerError(tr("the game refused this warp"))
         self.game_call(FN_RELOAD)
 
     def clear_forced_spawn(self):
-        """Zostawiony znacznik kierowałby w to miejsce także po śmierci."""
+        """A marker left behind would send the player here after a death too."""
         state = self.ptr(BASE + GAME_STATE)
         if state:
             self.write(state + 0x1520, b"\0")
@@ -407,7 +473,7 @@ class Game:
     def return_to_title(self):
         self.need_world()
         if not self.ptr(BASE + EVENT_MAN):
-            raise TrainerError("brak menedżera zdarzeń gry")
+            raise TrainerError(tr("the game's event manager is missing"))
         self.game_call(FN_SAVE_REQUEST)
         time.sleep(0.7)
         self.game_call(FN_RETURN_TITLE)
@@ -415,7 +481,7 @@ class Game:
     def _need_flags(self):
         self.need_world()
         if not self.ptr(BASE + EVENT_FLAG_MAN) or not self.ptr(BASE + EVENT_STATE):
-            raise TrainerError("flagi zdarzeń nie są jeszcze gotowe")
+            raise TrainerError(tr("event flags are not ready yet"))
 
     def get_event_flag(self, flag):
         self._need_flags()
@@ -425,12 +491,19 @@ class Game:
         self._need_flags()
         self.game_call(FN_SET_FLAG, 0, flag, 1 if value else 0)
 
-    def give_goods(self, goods_id, count):
-        """Dodaje przedmiot (kategoria „goods”) do niesionych. Zwraca, ile dodano."""
+    def _show_item(self, holder, category, item_id, count):
+        """Queues the item for the "acquired" box, the way the game does on pickup."""
+        queue = self.ptr(BASE + ITEM_POPUP_MAN)
+        # with neither a free nor a used node the game function would write to address zero
+        if queue and (self.ptr(queue + 0x10) or self.ptr(queue + 0x08)):
+            self.game_call(FN_ITEM_POPUP, queue, holder, category << 28, item_id, count, 0)
+
+    def give_goods(self, goods_id, count, popup=True):
+        """Adds an item (the "goods" category) to the inventory. Returns how many were added."""
         self.need_world()
         data = self.game_data()
         if not data:
-            raise TrainerError("brak danych postaci")
+            raise TrainerError(tr("character data is missing"))
         inventory = data + 0x328
         code = BASE + MAILBOX + 0xB0
         key = BASE + MAILBOX + 0xB4
@@ -438,20 +511,45 @@ class Game:
                                      0x80000000 | (3 << 28) | goods_id))
         fits = ctypes.c_int32(self.game_call(FN_ITEM_FITS, inventory, code, count) & 0xFFFFFFFF).value
         if fits <= 0:
-            raise TrainerError("nie wejdzie więcej (limit w ekwipunku)")
+            raise TrainerError(tr("no room for more (inventory limit)"))
         count = min(count, fits)
         slot = ctypes.c_int32(self.game_call(FN_ITEM_ADD, inventory, key, count) & 0xFFFFFFFF).value
         if slot < 0:
-            raise TrainerError("gra odrzuciła przedmiot")
+            raise TrainerError(tr("the game refused the item"))
+        if popup:
+            self._show_item(key, CATEGORY_GOODS, goods_id, count)
         return count
 
+    def give_equipment(self, category, item_id, popup=True):
+        """Adds one weapon or armor piece the way the game does: first creates the instance
+        (a holder), then puts it into the inventory."""
+        self.need_world()
+        data = self.game_data()
+        manager = self.ptr(BASE + ITEM_MAN)
+        if not data or not manager:
+            raise TrainerError(tr("character data is missing"))
+        create = {CATEGORY_WEAPON: FN_NEW_WEAPON, CATEGORY_ARMOR: FN_NEW_ARMOR}[category]
+        holder = BASE + MAILBOX + 0xB0
+        self.write(holder, bytes(0x20))
+        self.game_call(create, holder, manager, item_id)
+        if not self.unpack(holder, "<I"):
+            raise TrainerError(tr("the game did not create the item"))
+        try:
+            result = self.game_call(FN_GIVE_ANY, data + 0x1D0, 0, holder, 1, 0, 1, 0)
+            if ctypes.c_int32(result & 0xFFFFFFFF).value < 0:
+                raise TrainerError(tr("the game did not accept the item (inventory full?)"))
+            if popup:
+                self._show_item(holder, category, item_id, 1)
+        finally:
+            self.game_call(FN_RELEASE_ITEM, holder)
+
     def keep_items(self, saved):
-        """Nie pozwala maleć liczbie niesionych przedmiotów. `saved`: słownik między wywołaniami."""
+        """Keeps carried item counts from going down. `saved`: a dict kept between calls."""
         data = self.game_data()
         if not data:
             return
         inventory = data + 0x328
-        # pierwsze [+0x24] slotów to przedmioty fabularne (zostają w spokoju), dalej zwykłe
+        # the first [+0x24] slots hold key items (left alone), the ordinary ones follow
         total = self.unpack(inventory + 0x10, "<I")
         split = self.unpack(inventory + 0x24, "<I")
         base = self.ptr(inventory + 0x48)
@@ -471,7 +569,7 @@ class Game:
                 saved[slot] = (key, count)
 
     def characters(self):
-        """Wszystkie postacie świata poza graczem: lista adresów."""
+        """Every character in the world except the player: a list of addresses."""
         world = self.ptr(BASE + WORLD_CHR_MAN)
         if not world:
             return []
@@ -499,7 +597,7 @@ class Game:
         return found
 
     def nearby(self, limit=12, radius=60.0):
-        """[(odległość, chr, hp, max_hp, pozycja)] żywych postaci wokół gracza."""
+        """[(distance, chr, hp, max_hp, position)] of living characters around the player."""
         me = self.position(self.player())
         if me is None:
             return []
@@ -517,14 +615,15 @@ class Game:
         result.sort()
         return result[:limit]
 
-    # ---------------------------------------------------------------- klawiatura
+    # ---------------------------------------------------------------- keyboard
     def keyboard_state(self):
-        """Tablica klawiszy SDL gry (indeks = scancode) albo None."""
-        if not self.hooked:
+        """The game's SDL key table (index = scancode) or None."""
+        if not self.hooked or self.keyboard_missing:
             return None
         if not self.keyboard_ptr:
             function = self._host_symbol("libSDL3.so", "SDL_GetKeyboardState")
             if not function:
+                self.keyboard_missing = True
                 return None
             self.keyboard_ptr = self.call(function, 0, timeout=0.5)
         return self.read(self.keyboard_ptr, 100) if self.keyboard_ptr else None
@@ -533,16 +632,15 @@ class Game:
         base = path = None
         with open(f"/proc/{self.pid}/maps") as f:
             for line in f:
-                parts = line.split()
+                parts = line.rstrip("\n").split(None, 5)
                 if len(parts) > 5 and library in parts[5] and int(parts[2], 16) == 0:
                     base, path = int(parts[0].split("-")[0], 16), parts[5]
                     break
         if not path:
             return 0
-        out = subprocess.run(["nm", "-D", "--defined-only", path],
-                             capture_output=True, text=True).stdout
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) == 3 and parts[2].split("@")[0] == symbol:
-                return base + int(parts[0], 16)
-        return 0
+        try:
+            # through the game's root: an AppImage's files need not be visible at the same path
+            value = elf_symbol(f"/proc/{self.pid}/root{path}", symbol)
+        except (OSError, struct.error, IndexError):
+            return 0
+        return base + value if value else 0

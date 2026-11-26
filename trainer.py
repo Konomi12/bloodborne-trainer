@@ -1,58 +1,66 @@
 #!/usr/bin/env python3
-"""Trainer do nauki Bloodborne na bbport (w stylu SilkySouls). Uruchom: trainer.py [--play]"""
+"""Practice trainer for Bloodborne on bbport (SilkySouls style). Usage: trainer.py [--play]"""
 import glob
 import json
 import os
 import select
+import shutil
 import struct
 import subprocess
 import sys
 import time
-from pathlib import Path
 
-import gi
+import requirements
+
+requirements.check()
+
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
+import bbport  # noqa: E402
+import config  # noqa: E402
 import engine  # noqa: E402
 import gamedata  # noqa: E402
+import i18n  # noqa: E402
+from i18n import tr  # noqa: E402
 
-STATE_DIR = Path.home() / ".local/share/bb-trainer"
+STATE_DIR = config.DATA_HOME / "bb-trainer"
 POSITIONS = STATE_DIR / "positions.json"
 GAME_LOG = STATE_DIR / "game.log"
 
-# scancode SDL, klawisz GTK, opis, akcja
+# SDL scancode, GTK key, label, description, action (descriptions are translated on screen)
 HOTKEYS = [
-    (62, Gdk.KEY_F5, "F5", "Zapisz pozycję", "save_position"),
-    (63, Gdk.KEY_F6, "F6", "Wczytaj pozycję", "load_position"),
-    (64, Gdk.KEY_F7, "F7", "Pełne HP i stamina", "heal"),
-    (65, Gdk.KEY_F8, "F8", "Nieśmiertelność wł./wył.", "toggle_no_dead"),
-    (67, Gdk.KEY_F10, "F10", "Powtórz ostatni warp", "repeat_warp"),
+    (62, Gdk.KEY_F5, "F5", "Save position", "save_position"),
+    (63, Gdk.KEY_F6, "F6", "Load position", "load_position"),
+    (64, Gdk.KEY_F7, "F7", "Full HP and stamina", "heal"),
+    (65, Gdk.KEY_F8, "F8", "No death on/off", "toggle_no_dead"),
+    (67, Gdk.KEY_F10, "F10", "Repeat last warp", "repeat_warp"),
 ]
 PAD_ACTIONS = {"up": "save_position", "down": "load_position", "left": "heal", "right": "repeat_warp"}
 
 PLAYER_TOGGLES = [
-    ("no_dead", "Nieśmiertelność", "HP nie spadnie poniżej 1"),
-    ("one_hit", "Zabijanie jednym ciosem", None),
-    ("all_no_stamina", "Nieskończona stamina", "Flaga gry: działa na wszystkie postacie"),
-    ("no_bullets", "Nieskończone kule", "Strzały nie zużywają Quicksilver Bullets"),
-    ("hidden", "Niewidzialność", "Wrogowie cię nie widzą"),
-    ("silent", "Cisza", "Wrogowie cię nie słyszą"),
+    ("no_dead", "No death", "HP never drops below 1"),
+    ("one_hit", "One-hit kill", None),
+    ("all_no_stamina", "Infinite stamina", "Game flag: applies to every character"),
+    ("no_bullets", "Infinite bullets", "Shots do not use Quicksilver Bullets"),
+    ("hidden", "Invisibility", "Enemies cannot see you"),
+    ("silent", "Silence", "Enemies cannot hear you"),
 ]
 ENEMY_TOGGLES = [
-    ("all_no_ai", "Wyłącz AI", "Wrogowie stoją i nic nie robią"),
-    ("all_no_attack", "Wrogowie nie atakują", None),
-    ("all_no_move", "Nikt się nie rusza", "Flaga gry: obejmuje też ciebie"),
-    ("all_no_damage", "Nikt nie dostaje obrażeń", "Obejmuje też ciebie"),
-    ("all_no_hit", "Brak trafień", "Obejmuje też ciebie"),
-    ("all_no_dead", "Nikt nie może zginąć", "HP wszystkich zatrzymuje się na 1"),
+    ("all_no_ai", "Disable AI", "Enemies stand and do nothing"),
+    ("all_no_attack", "Enemies do not attack", None),
+    ("all_no_move", "Nobody moves", "Game flag: includes you"),
+    ("all_no_damage", "Nobody takes damage", "Includes you"),
+    ("all_no_hit", "No hits", "Includes you"),
+    ("all_no_dead", "Nobody can die", "Everyone's HP stops at 1"),
 ]
 
 
 class Pad:
-    """Skróty z pada przez evdev: przytrzymaj Select/View i wciśnij kierunek na krzyżaku."""
+    """Gamepad shortcuts through evdev: hold Select/View and press a D-pad direction."""
 
     EVENT = struct.Struct("llHHi")
 
@@ -109,12 +117,13 @@ class Window(Adw.ApplicationWindow):
         self.toggles = {}
         self.keys_down = set()
         self.last_warp = None
-        self.forced_spawn = None  # słownik, dopóki czekamy na wczytanie po „Leć” do bossa
-        self.story_flag = None    # walka z końca gry przygotowana w tej sesji trainera
+        self.forced_spawn = None  # a dict while we wait for the load after "Go" to a boss
+        self.story_flag = None    # the late-game fight prepared in this trainer session
         self.story_practice = True
         self.frozen = {}          # chr -> hp
         self.item_counts = {}
         self.slot = 0
+        self.start_after_choice = False
         self.positions = self.load_positions()
         self.ticks = 0
         self.build()
@@ -124,14 +133,15 @@ class Window(Adw.ApplicationWindow):
         self.connect("close-request", self.on_close)
         self.timer = GLib.timeout_add(30, self.tick)
 
-    # ---------------------------------------------------------------- budowa okna
+    # ---------------------------------------------------------------- building the window
     def build(self):
         self.overlay = Adw.ToastOverlay()
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        self.title_widget = Adw.WindowTitle(title="Bloodborne Trainer", subtitle="Szukam gry…")
+        self.title_widget = Adw.WindowTitle(title="Bloodborne Trainer",
+                                            subtitle=tr("Looking for the game…"))
         header.set_title_widget(self.title_widget)
-        self.play_button = Gtk.Button(label="Uruchom grę", css_classes=["suggested-action"])
+        self.play_button = Gtk.Button(label=tr("Start game"), css_classes=["suggested-action"])
         self.play_button.connect("clicked", lambda *_: self.start_game())
         header.pack_start(self.play_button)
         view.add_top_bar(header)
@@ -139,15 +149,15 @@ class Window(Adw.ApplicationWindow):
         switcher = Adw.ViewSwitcher(stack=stack, policy=Adw.ViewSwitcherPolicy.NARROW)
         view.add_top_bar(switcher)
         for name, title, icon, builder in (
-                ("player", "Gracz", "avatar-default-symbolic", self.page_player),
-                ("travel", "Podróż", "find-location-symbolic", self.page_travel),
-                ("enemies", "Wrogowie", "view-reveal-symbolic", self.page_enemies),
-                ("items", "Itemy", "view-grid-symbolic", self.page_items),
-                ("stats", "Staty", "view-list-symbolic", self.page_stats),
-                ("game", "Gra", "preferences-system-symbolic", self.page_game)):
+                ("player", "Player", "avatar-default-symbolic", self.page_player),
+                ("travel", "Travel", "find-location-symbolic", self.page_travel),
+                ("enemies", "Enemies", "view-reveal-symbolic", self.page_enemies),
+                ("items", "Items", "view-grid-symbolic", self.page_items),
+                ("stats", "Stats", "view-list-symbolic", self.page_stats),
+                ("game", "Game", "preferences-system-symbolic", self.page_game)):
             page = Adw.PreferencesPage()
             builder(page)
-            stack.add_titled_with_icon(page, name, title, icon)
+            stack.add_titled_with_icon(page, name, tr(title), icon)
         view.set_content(stack)
         self.overlay.set_child(view)
         self.set_content(self.overlay)
@@ -174,9 +184,9 @@ class Window(Adw.ApplicationWindow):
         return row
 
     def switch(self, group, key, title, subtitle):
-        row = Adw.SwitchRow(title=title)
+        row = Adw.SwitchRow(title=tr(title))
         if subtitle:
-            row.set_subtitle(subtitle)
+            row.set_subtitle(tr(subtitle))
         self.toggles[key] = row
         group.add(row)
         return row
@@ -189,155 +199,249 @@ class Window(Adw.ApplicationWindow):
         return spin
 
     def page_player(self, page):
-        group = self.group(page, "Stan")
-        self.hp_row = self.row(group, "HP / stamina", self.button("Ulecz", self.heal),
-                               self.button("Zgiń", lambda: self.game.kill_player()))
+        group = self.group(page, tr("Status"))
+        self.hp_row = self.row(group, "HP / stamina", self.button(tr("Heal"), self.heal),
+                               self.button(tr("Die"), lambda: self.game.kill_player()))
         self.hp_spin = self.spin(1, 99999, 100)
-        self.row(group, "Ustaw HP", self.hp_spin, self.button(
-            "Ustaw", lambda: self.game.set_hp(self.game.need_world(), self.hp_spin.get_value())))
-        self.freeze_hp = Adw.SwitchRow(title="Zawsze pełne HP",
-                                       subtitle="Tylko ty; mocny cios nadal może zabić")
-        self.freeze_stamina = Adw.SwitchRow(title="Zawsze pełna stamina", subtitle="Tylko ty")
+        self.row(group, tr("Set HP"), self.hp_spin, self.button(
+            tr("Set"),
+            lambda: self.game.set_hp(self.game.need_world(), self.hp_spin.get_value())))
+        self.freeze_hp = Adw.SwitchRow(
+            title=tr("Always full HP"), subtitle=tr("Only you; a heavy hit can still kill"))
+        self.freeze_stamina = Adw.SwitchRow(title=tr("Always full stamina"),
+                                            subtitle=tr("Only you"))
         group.add(self.freeze_hp)
         group.add(self.freeze_stamina)
         self.keep_items = Adw.SwitchRow(
-            title="Nieskończone przedmioty",
-            subtitle="Fiolki, koktajle itd. wracają po użyciu (miej min. 2 sztuki)")
+            title=tr("Infinite items"),
+            subtitle=tr("Vials, cocktails etc. come back after use (carry at least 2)"))
         group.add(self.keep_items)
-        cheats = self.group(page, "Ułatwienia")
+        cheats = self.group(page, tr("Cheats"))
         for toggle in PLAYER_TOGGLES:
             self.switch(cheats, *toggle)
 
     def page_travel(self, page):
-        group = self.group(page, "Zapisana pozycja", "F5 zapisuje, F6 wczytuje (w tej samej mapie)")
-        self.slot_drop = Gtk.DropDown.new_from_strings([f"Slot {i}" for i in range(1, 6)])
+        group = self.group(page, tr("Saved position"),
+                           tr("F5 saves, F6 loads (within the same map)"))
+        self.slot_drop = Gtk.DropDown.new_from_strings(
+            [tr("Slot {}").format(i) for i in range(1, 6)])
         self.slot_drop.set_valign(Gtk.Align.CENTER)
         self.slot_drop.connect("notify::selected", lambda *_: self.show_slot())
-        self.position_row = self.row(group, "Teraz", self.slot_drop)
-        self.slot_row = self.row(group, "W slocie",
-                                 self.button("Zapisz", self.save_position),
-                                 self.button("Wczytaj", self.load_position))
-        self.with_hp = Adw.SwitchRow(title="Wczytuj razem z HP i staminą", active=True)
+        self.position_row = self.row(group, tr("Now"), self.slot_drop)
+        self.slot_row = self.row(group, tr("In slot"),
+                                 self.button(tr("Save"), self.save_position),
+                                 self.button(tr("Load"), self.load_position))
+        self.with_hp = Adw.SwitchRow(title=tr("Restore HP and stamina too"), active=True)
         group.add(self.with_hp)
         self.step = self.spin(0.5, 100, 3, 0.5, 1)
-        self.row(group, "Przesuń o (metry)", self.step,
-                 self.button("Góra", lambda: self.nudge(1)),
-                 self.button("Dół", lambda: self.nudge(-1)))
+        self.row(group, tr("Move by (metres)"), self.step,
+                 self.button(tr("Up"), lambda: self.nudge(1)),
+                 self.button(tr("Down"), lambda: self.nudge(-1)))
         self.show_slot()
 
-        warp = self.group(page, "Warp do lampy",
-                          "Także do niezapalonych. Cel staje się twoją ostatnią lampą.")
+        warp = self.group(page, tr("Warp to a lamp"),
+                          tr("Unlit ones too. The target becomes your last lamp."))
         try:
             self.lamps = gamedata.lamps()
-        except Exception as error:  # brak plików gry: reszta ma działać
+        except Exception as error:  # no game files: the rest should still work
             self.lamps = []
-            warp.set_description(f"Nie wczytałem listy lamp: {error}")
+            warp.set_description(GLib.markup_escape_text(
+                tr("Could not load the lamp list: {}").format(error)))
         for point, name in self.lamps:
-            self.row(warp, name, self.button("Leć", lambda p=point: self.warp(p)))
+            self.row(warp, name, self.button(tr("Go"), lambda p=point: self.warp(p)))
 
-        bosses = self.group(page, "Bossowie",
-                            "„Leć” stawia cię przed wejściem do walki. „Wskrześ” kasuje flagę "
-                            "pokonania; boss wraca po „Leć”. Pinezka zapisuje twoje obecne "
-                            "miejsce jako własne wejście. Przed wskrzeszaniem zrób kopię "
-                            "zapisu w zakładce Gra.")
-        for flag, name, entry in gamedata.BOSSES:
+        bosses = self.group(page, tr("Bosses"), tr(
+            "“Go” puts you in front of the fight entrance. “Revive” clears the defeat flag; the "
+            "boss is back after “Go”. The pin saves your current spot as your own entrance. Back "
+            "up your save in the Game tab before reviving."))
+        for flag, name, entry in gamedata.bosses():
             row = self.row(bosses, name)
-            row.add_suffix(self.button("Stan", lambda f=flag, r=row: r.set_subtitle(
-                "pokonany" if self.game.get_event_flag(f) else "żyje")))
-            row.add_suffix(self.button("Wskrześ", lambda f=flag, r=row: self.set_boss(f, r, False)))
-            row.add_suffix(self.button("Pokonany", lambda f=flag, r=row: self.set_boss(f, r, True)))
+            row.add_suffix(self.button(tr("Check"), lambda f=flag, r=row: r.set_subtitle(
+                tr("defeated") if self.game.get_event_flag(f) else tr("alive"))))
+            row.add_suffix(self.button(
+                tr("Revive"), lambda f=flag, r=row: self.set_boss(f, r, False)))
+            row.add_suffix(self.button(
+                tr("Defeated"), lambda f=flag, r=row: self.set_boss(f, r, True)))
             pin = Gtk.Button(valign=Gtk.Align.CENTER)
             self.show_pin(pin, flag)
             pin.connect("clicked", lambda b, f=flag: self.run(lambda: self.pin_entry(b, f)))
             row.add_suffix(pin)
-            row.add_suffix(self.button("Leć", lambda f=flag, e=entry: self.warp_boss(f, e)))
+            row.add_suffix(self.button(
+                tr("Go"), lambda f=flag, e=entry: self.warp_boss(f, e)))
 
     def page_enemies(self, page):
-        group = self.group(page, "Zachowanie")
+        group = self.group(page, tr("Behaviour"))
         for toggle in ENEMY_TOGGLES:
             self.switch(group, *toggle)
-        self.near_group = self.group(page, "W pobliżu (od najbliższego)",
-                                     "Odświeża się samo, gdy zakładka jest widoczna")
+        self.near_group = self.group(page, tr("Nearby (closest first)"),
+                                     tr("Refreshes by itself while this tab is visible"))
         self.near_rows = []
         for index in range(10):
             row = Adw.ActionRow(title="—", visible=False)
-            for label, action in (("Zabij", lambda c: self.game.set_hp(c, 0)),
+            for label, action in ((tr("Kill"), lambda c: self.game.set_hp(c, 0)),
                                   ("1 HP", lambda c: self.game.set_hp(c, 1)),
-                                  ("Pełne", self.fill_enemy),
-                                  ("Zamroź HP", self.freeze_enemy),
-                                  ("Do niego", self.goto_enemy)):
+                                  (tr("Full"), self.fill_enemy),
+                                  (tr("Freeze HP"), self.freeze_enemy),
+                                  (tr("Go to"), self.goto_enemy)):
                 row.add_suffix(self.button(
                     label, lambda i=index, a=action: self.on_enemy(i, a)))
             self.near_group.add(row)
             self.near_rows.append([row, 0])
 
     def page_items(self, page):
-        group = self.group(page, "Dodaj przedmiot",
-                           "Zwykłe przedmioty (bez broni i strojów). Przedmioty fabularne "
-                           "mogą popsuć zapis.")
+        options = self.group(page, tr("Add an item"), tr(
+            "Click a group to open it. Story items can break your save."))
         self.amount = self.spin(1, 999, 20)
-        self.row(group, "Ile", self.amount)
-        search = Gtk.SearchEntry(placeholder_text="Szukaj po nazwie z gry…")
-        group.add(search)
+        self.row(options, tr("Amount"), self.amount,
+                 subtitle=tr("Weapons and attire are added one at a time"))
+        self.upgrade = self.spin(0, 10, 0)
+        self.row(options, tr("Weapon upgrade"), self.upgrade, subtitle=tr("+0 to +10"))
+        self.variant = Gtk.DropDown.new_from_strings(
+            [tr(n) for n, _ in gamedata.WEAPON_VARIANTS])
+        self.variant.set_valign(Gtk.Align.CENTER)
+        self.row(options, tr("Weapon variant"), self.variant,
+                 subtitle=tr("Uncanny and Lost have different gem slots"))
+        self.popup = Adw.SwitchRow(title=tr("Popup in game"), active=True,
+                                   subtitle=tr("The game shows the item you received"))
+        options.add(self.popup)
+        search = Gtk.SearchEntry(placeholder_text=tr("Search by in-game name…"))
+        options.add(search)
         results = self.group(page, "")
         try:
-            items = gamedata.goods()
+            catalog = gamedata.catalog()
         except Exception as error:
-            items = []
-            group.set_description(f"Nie wczytałem listy przedmiotów: {error}")
-        rows = []
-        for ident, name in items:
-            row = self.row(results, name, self.button(
-                "Dodaj", lambda i=ident, n=name: self.give(i, n)), subtitle=f"id {ident}")
-            rows.append((row, f"{name} {ident}".casefold()))
+            catalog = []
+            options.set_description(GLib.markup_escape_text(
+                tr("Could not load the item list: {}").format(error)))
+        groups = []
+        for title, items in catalog:
+            expander = Adw.ExpanderRow(title=GLib.markup_escape_text(tr(title)),
+                                       subtitle=tr("Items: {}").format(len(items)))
+            rows = []
+            for item in items:
+                row = Adw.ActionRow(title=GLib.markup_escape_text(item["name"]))
+                row.add_suffix(self.button(tr("Add"), lambda i=item: self.give(i)))
+                expander.add_row(row)
+                rows.append((row, item["name"].casefold()))
+            results.add(expander)
+            groups.append((expander, rows))
 
         def filter_rows(entry):
-            text = entry.get_text().casefold()
-            for row, key in rows:
-                row.set_visible(text in key)
+            text = entry.get_text().strip().casefold()
+            for expander, rows in groups:
+                found = 0
+                for row, key in rows:
+                    row.set_visible(text in key)
+                    found += text in key
+                expander.set_visible(found > 0)
+                expander.set_expanded(bool(text) and found > 0)
 
         search.connect("search-changed", filter_rows)
 
     def page_stats(self, page):
-        group = self.group(page, "Postać",
-                           "Zmiany zapisują się w grze. HP i stamina przeliczą się po "
-                           "przeładowaniu.")
+        group = self.group(page, tr("Character"), tr(
+            "Changes are saved by the game. HP and stamina update after a reload."))
         self.stat_spins = {}
         for name in engine.STATS:
-            high = 999_999_999 if name == "Echa krwi" else 999 if name in ("Poziom",) else 99
+            high = 999_999_999 if name == "Blood echoes" else 999 if name == "Level" else 99
             spin = self.spin(0, high, 0)
             self.stat_spins[name] = spin
-            self.row(group, name, spin, self.button("Ustaw", lambda n=name: self.set_stat(n)))
+            self.row(group, tr(name), spin,
+                     self.button(tr("Set"), lambda n=name: self.set_stat(n)))
         self.ng_spin = self.spin(0, 7, 0)
-        self.row(group, "Cykl NG+", self.ng_spin, self.button("Ustaw", self.set_ng))
-        self.row(group, "Wartości z gry", self.button("Odczytaj", self.read_stats))
+        self.row(group, tr("NG+ cycle"), self.ng_spin, self.button(tr("Set"), self.set_ng))
+        self.row(group, tr("Values from the game"), self.button(tr("Read"), self.read_stats))
 
     def page_game(self, page):
-        group = self.group(page, "Gra")
+        group = self.group(page, tr("Game"))
         self.speed = self.spin(0.1, 3.0, 1.0, 0.1, 2)
         self.speed.connect("value-changed", lambda s: self.game.set_speed(s.get_value()))
-        self.row(group, "Prędkość gry", self.speed,
+        self.row(group, tr("Game speed"), self.speed,
                  self.button("1×", lambda: self.speed.set_value(1.0)))
-        self.row(group, "Wyjdź do menu głównego",
-                 self.button("Wyjdź", lambda: self.game.return_to_title()),
-                 subtitle="Szybki reset sytuacji")
-        self.row(group, "Przywróć fabułę", self.button("Przywróć", self.restore_story),
-                 subtitle="Po walce z Gehrmanem / Moon Presence (zadziała po warpie)")
-        self.row(group, "Kopia zapisów", self.button("Zrób kopię", self.backup_saves),
-                 subtitle="Do ~/.local/share/bb-trainer/saves")
-        keys = self.group(page, "Skróty")
-        self.keyboard_on = Adw.SwitchRow(title="Klawiatura (w grze i w trainerze)", active=True)
-        self.pad_on = Adw.SwitchRow(title="Pad: trzymaj Select/View + krzyżak", active=True,
-                                    subtitle="Góra zapisz, dół wczytaj, lewo ulecz, prawo warp")
+        self.row(group, tr("Quit to main menu"),
+                 self.button(tr("Quit"), lambda: self.game.return_to_title()),
+                 subtitle=tr("A quick reset"))
+        self.row(group, tr("Restore story"), self.button(tr("Restore"), self.restore_story),
+                 subtitle=tr("After a Gehrman / Moon Presence fight (a warp does it too)"))
+        self.row(group, tr("Save backup"), self.button(tr("Back up"), self.backup_saves),
+                 subtitle=tr("To {}").format(STATE_DIR / "saves"))
+        view = self.group(page, tr("View"))
+        self.hitboxes = Adw.SwitchRow(
+            title=tr("Attack hitboxes"),
+            subtitle=tr("A yellow mesh shows where and when a hit lands (yours and enemies')"))
+        view.add(self.hitboxes)
+        keys = self.group(page, tr("Shortcuts"))
+        self.keyboard_on = Adw.SwitchRow(title=tr("Keyboard (in game and in the trainer)"),
+                                         active=True)
+        self.pad_on = Adw.SwitchRow(
+            title=tr("Gamepad: hold Select/View + D-pad"), active=True,
+            subtitle=tr("Up save, down load, left heal, right warp"))
         keys.add(self.keyboard_on)
         keys.add(self.pad_on)
         for _, _, key, text, _ in HOTKEYS:
-            self.row(keys, text, Gtk.Label(label=key))
-        note = self.group(page, "Uwaga")
-        self.row(note, "Nie używaj w co-opie online",
-                 subtitle="Flagi i prędkość psują sesję drugiej osobie")
+            self.row(keys, tr(text), Gtk.Label(label=key))
+        setup = self.group(page, tr("Setup"))
+        self.bbport_row = self.row(
+            setup, "bbport", self.button(tr("AppImage or script…"), self.pick_bbport_file),
+            self.button(tr("Folder…"), self.pick_bbport_folder))
+        self.show_bbport()
+        codes = list(i18n.LANGUAGES)
+        language = Gtk.DropDown.new_from_strings(list(i18n.LANGUAGES.values()))
+        language.set_selected(codes.index(i18n.LANGUAGE))
+        language.set_valign(Gtk.Align.CENTER)
+        language.connect("notify::selected",
+                         lambda drop, _: self.run(
+                             lambda: self.set_language(codes[drop.get_selected()])))
+        self.row(setup, "Language / Język", language)
+        note = self.group(page, tr("Warning"))
+        self.row(note, tr("Do not use in online co-op"),
+                 subtitle=tr("Flags and speed changes ruin the other player's session"))
 
-    # ---------------------------------------------------------------- akcje
+    # ---------------------------------------------------------------- setup
+    def show_bbport(self):
+        install = bbport.find()
+        self.bbport_row.set_subtitle(GLib.markup_escape_text(
+            str(install.path) if install else tr("not found: pick it with a button")))
+
+    def pick_bbport_file(self):
+        self.file_dialog(tr("bbport: the AppImage, Bloodborne.sh or bbport_launcher.py"),
+                         "open", self.use_bbport)
+
+    def pick_bbport_folder(self):
+        self.file_dialog(tr("The bbport folder"), "select_folder", self.use_bbport)
+
+    def file_dialog(self, title, method, then):
+        dialog = Gtk.FileDialog(title=title)
+
+        def done(dialog, result):
+            try:
+                chosen = getattr(dialog, method + "_finish")(result)
+            except GLib.Error:      # cancelled
+                self.start_after_choice = False
+                return
+            self.run(lambda: then(chosen.get_path()))
+
+        getattr(dialog, method)(self, None, done)
+
+    def use_bbport(self, path):
+        start, self.start_after_choice = self.start_after_choice, False
+        try:
+            bbport.choose(path)
+        except ValueError as error:
+            raise engine.TrainerError(str(error)) from error
+        self.show_bbport()
+        if not self.lamps:      # no game files at startup; a restart reads them again
+            self.toast(tr("Saved. Restart the trainer to load the lamp and item lists."))
+            return
+        self.toast(tr("Saved."))
+        if start:
+            self.start_game()
+
+    def set_language(self, code):
+        config.put("language", code)
+        self.toast(i18n.translate("Restart the trainer to change the language.", code))
+
+    # ---------------------------------------------------------------- actions
     def toast(self, text):
         toast = Adw.Toast(title=GLib.markup_escape_text(text), timeout=3)
         self.overlay.add_toast(toast)
@@ -346,7 +450,7 @@ class Window(Adw.ApplicationWindow):
         try:
             action()
         except (engine.TrainerError, OSError, TypeError, struct.error) as error:
-            self.toast(str(error) or "Nie udało się")
+            self.toast(str(error) or tr("That did not work"))
 
     def heal(self):
         self.game.full_heal()
@@ -354,7 +458,7 @@ class Window(Adw.ApplicationWindow):
     def toggle_no_dead(self):
         row = self.toggles["no_dead"]
         row.set_active(not row.get_active())
-        self.toast("Nieśmiertelność " + ("włączona" if row.get_active() else "wyłączona"))
+        self.toast(tr("No death on") if row.get_active() else tr("No death off"))
 
     def load_positions(self):
         try:
@@ -366,27 +470,28 @@ class Window(Adw.ApplicationWindow):
         self.slot = self.slot_drop.get_selected()
         saved = self.positions.get(str(self.slot))
         self.slot_row.set_subtitle(
-            "pusty" if not saved else "x {:.1f}  y {:.1f}  z {:.1f}".format(*saved["position"]))
+            tr("empty") if not saved
+            else "x {:.1f}  y {:.1f}  z {:.1f}".format(*saved["position"]))
 
     def save_position(self):
         player = self.game.need_world()
         where = self.game.position(player)
         if where is None:
-            raise engine.TrainerError("nie mogę odczytać pozycji")
+            raise engine.TrainerError(tr("cannot read the position"))
         hp, _, stamina, _ = self.game.vitals(player)
         self.positions[str(self.slot)] = {"position": where[0], "rotation": where[1],
                                           "map": self.game.map_id(), "hp": hp, "stamina": stamina}
         self.write_positions()
         self.show_slot()
-        self.toast(f"Zapisano pozycję w slocie {self.slot + 1}")
+        self.toast(tr("Position saved in slot {}").format(self.slot + 1))
 
     def load_position(self):
         player = self.game.need_world()
         saved = self.positions.get(str(self.slot))
         if not saved:
-            raise engine.TrainerError("ten slot jest pusty")
+            raise engine.TrainerError(tr("this slot is empty"))
         if saved["map"] != self.game.map_id():
-            raise engine.TrainerError("pozycja jest z innej mapy: najpierw zrób warp")
+            raise engine.TrainerError(tr("that position is on another map: warp there first"))
         self.game.teleport(saved["position"], saved["rotation"])
         if self.with_hp.get_active():
             self.game.set_hp(player, saved["hp"])
@@ -420,7 +525,7 @@ class Window(Adw.ApplicationWindow):
         else:
             target = gamedata.boss_entry(entry)
         story = gamedata.STORY_FIGHTS.get(flag)
-        if story:  # przy każdym podejściu od nowa: po walce gra zmienia te flagi
+        if story:  # set again on every attempt: the game changes these flags after the fight
             for story_flag, value in story.items():
                 self.game.set_event_flag(story_flag, value)
         self.game.warp_position(*target)
@@ -428,18 +533,18 @@ class Window(Adw.ApplicationWindow):
                              "deadline": time.monotonic() + 90}
         self.last_warp = lambda: self.warp_boss(flag, entry)
 
-    # ---------------------------------------------------------------- walki z końca gry
+    # ---------------------------------------------------------------- late-game fights
     def ask_story(self, flag, entry):
         name = next(n for f, n, _ in gamedata.BOSSES if f == flag)
         dialog = Adw.AlertDialog(
             heading=name,
-            body="To walka z końca gry. Trainer zrobi kopię zapisu, ustawi flagi fabuły i "
-                 "przywróci je, gdy polecisz gdzie indziej.\n\n"
-                 "Prawdziwa wygrana kończy grę i zaczyna NG+. W trybie treningowym boss "
-                 "odzyskuje HP, gdy spadnie poniżej 25%, a one-shot jest wyłączony.")
-        dialog.add_response("cancel", "Anuluj")
-        dialog.add_response("real", "Można go zabić")
-        dialog.add_response("practice", "Trening")
+            body=tr("This is a late-game fight. The trainer backs up your save, sets the story "
+                    "flags and restores them when you warp somewhere else.\n\n"
+                    "A real win ends the game and starts NG+. In practice mode the boss "
+                    "recovers its HP when it drops below 25% and one-hit kill is off."))
+        dialog.add_response("cancel", tr("Cancel"))
+        dialog.add_response("real", tr("Killable"))
+        dialog.add_response("practice", tr("Practice"))
         dialog.set_response_appearance("real", Adw.ResponseAppearance.DESTRUCTIVE)
         dialog.set_response_appearance("practice", Adw.ResponseAppearance.SUGGESTED)
         dialog.set_default_response("practice")
@@ -450,9 +555,9 @@ class Window(Adw.ApplicationWindow):
 
     def start_story(self, flag, entry, practice):
         self.game.need_world()
-        self.backup_saves()  # bez kopii nie ruszamy fabuły
+        self.backup_saves()  # no backup, no story changes
         if "story" not in self.positions:
-            # oryginały zapisujemy raz: kolejna walka nie może ich nadpisać zmienionymi
+            # store the originals once: the next fight must not overwrite them with changed ones
             wanted = sorted({f for flags in gamedata.STORY_FIGHTS.values() for f in flags})
             self.positions["story"] = {
                 "ng": self.ng_cycle(),
@@ -473,15 +578,15 @@ class Window(Adw.ApplicationWindow):
         if saved["ng"] == self.ng_cycle():
             for flag, value in saved["flags"].items():
                 self.game.set_event_flag(int(flag), value)
-            self.toast("Przywrócono stan fabuły")
+            self.toast(tr("Story state restored"))
         else:
-            self.toast("Gra przeszła do nowego cyklu: starych flag nie przywracam")
+            self.toast(tr("The game moved to a new cycle: not restoring old flags"))
         del self.positions["story"]
         self.story_flag = None
         self.write_positions()
 
     def guard_story_boss(self):
-        """Tryb treningowy: boss we Śnie nie może zginąć, bo to kończy grę."""
+        """Practice mode: a boss in the Dream must not die, because that ends the game."""
         if not (self.story_flag and self.story_practice) or self.game.map_id() != 0x15000000:
             return
         self.toggles["one_hit"].set_active(False)
@@ -490,30 +595,30 @@ class Window(Adw.ApplicationWindow):
             vitals = self.game.vitals(chr_)
             if vitals and vitals[1] >= 5000 and 0 < vitals[0] < vitals[1] * 0.25:
                 self.game.set_i32(self.game.chr_data(chr_) + 0xF8, vitals[1])
-                self.toast("Boss odzyskał HP (tryb treningowy)")
+                self.toast(tr("The boss recovered its HP (practice mode)"))
 
     def repeat_warp(self):
         if self.last_warp is None:
-            raise engine.TrainerError("nie było jeszcze warpu")
+            raise engine.TrainerError(tr("no warp yet"))
         self.last_warp()
 
     def show_pin(self, button, flag):
         saved = f"boss:{flag}" in self.positions
-        button.set_label("↺" if saved else "📌")  # ikony motywu bywają nieczytelne
-        button.set_tooltip_text("Wróć do domyślnego wejścia" if saved
-                                else "Zapisz obecne miejsce jako wejście do tego bossa")
+        button.set_label("↺" if saved else "📌")  # theme icons can be hard to read
+        button.set_tooltip_text(tr("Back to the default entrance") if saved
+                                else tr("Save this spot as the entrance to this boss"))
 
     def pin_entry(self, button, flag):
         key = f"boss:{flag}"
         if self.positions.pop(key, None) is None:
             where = self.game.position(self.game.need_world())
             if where is None:
-                raise engine.TrainerError("nie mogę odczytać pozycji")
+                raise engine.TrainerError(tr("cannot read the position"))
             self.positions[key] = {"position": where[0], "rotation": where[1],
                                    "map": self.game.map_id()}
-            self.toast("„Leć” będzie teraz wracać w to miejsce")
+            self.toast(tr("“Go” will now bring you to this spot"))
         else:
-            self.toast("Przywrócono domyślne wejście")
+            self.toast(tr("Default entrance restored"))
         self.write_positions()
         self.show_pin(button, flag)
 
@@ -522,8 +627,8 @@ class Window(Adw.ApplicationWindow):
         POSITIONS.write_text(json.dumps(self.positions))
 
     def finish_forced_spawn(self, in_world):
-        """Zdejmuje znacznik wymuszonego miejsca, ale dopiero gdy wczytanie na pewno się
-        skończyło: gra czyta go późno, a „w świecie” potrafi mrugnąć w trakcie ładowania."""
+        """Removes the forced spawn marker, but only once loading has surely finished: the game
+        reads it late, and "in world" can flicker during a load."""
         spawn = self.forced_spawn
         if not spawn:
             return
@@ -540,13 +645,13 @@ class Window(Adw.ApplicationWindow):
 
     def set_boss(self, flag, row, dead):
         self.game.set_event_flag(flag, dead)
-        row.set_subtitle("pokonany" if self.game.get_event_flag(flag) else "żyje")
+        row.set_subtitle(tr("defeated") if self.game.get_event_flag(flag) else tr("alive"))
 
     def on_enemy(self, index, action):
         self.game.need_world()
         chr_ = self.near_rows[index][1]
         if chr_ not in self.game.characters():
-            raise engine.TrainerError("tej postaci już nie ma")
+            raise engine.TrainerError(tr("that character is gone"))
         action(chr_)
 
     def fill_enemy(self, chr_):
@@ -561,9 +666,27 @@ class Window(Adw.ApplicationWindow):
         where = self.game.position(chr_)
         self.game.teleport([where[0][0] + 1.5, where[0][1] + 0.3, where[0][2]])
 
-    def give(self, ident, name):
-        added = self.game.give_goods(ident, int(self.amount.get_value()))
-        self.toast(f"Dodano {added} × {name}")
+    def give(self, item):
+        name = item["name"]
+        popup = self.popup.get_active()
+        if item["kind"] == "goods":
+            added = self.game.give_goods(item["id"], int(self.amount.get_value()), popup)
+            self.toast(tr("Added {} × {}").format(added, name))
+        elif item["kind"] == "armor":
+            self.game.give_equipment(engine.CATEGORY_ARMOR, item["id"], popup)
+            self.toast(tr("Added: {}").format(name))
+        else:
+            variant, offset = gamedata.WEAPON_VARIANTS[self.variant.get_selected()]
+            note = ""
+            if offset not in item["levels"]:  # e.g. firearms: normal only
+                note = tr(" – there is no {} variant, gave the normal one").format(tr(variant))
+                offset = 0
+            levels = item["levels"][offset]
+            level = min(int(self.upgrade.get_value()), max(levels))
+            level = max(i for i in levels if i <= level)
+            self.game.give_equipment(engine.CATEGORY_WEAPON, levels[level], popup)
+            extra = f" ({variant})" if offset else ""
+            self.toast(tr("Added: {}").format(f"{name} +{level}{extra}{note}"))
 
     def read_stats(self):
         self.game.need_world()
@@ -577,51 +700,85 @@ class Window(Adw.ApplicationWindow):
     def set_stat(self, name):
         self.game.need_world()
         if not getattr(self, "stats_read", False):
-            raise engine.TrainerError("najpierw „Odczytaj”, żeby nie wpisać zer")
+            raise engine.TrainerError(tr("press “Read” first, so you do not write zeros"))
         self.game.set_i32(self.game.game_data() + engine.STATS[name],
                           self.stat_spins[name].get_value())
 
     def set_ng(self):
         self.game.need_world()
         if not getattr(self, "stats_read", False):
-            raise engine.TrainerError("najpierw „Odczytaj”")
+            raise engine.TrainerError(tr("press “Read” first"))
         self.game.set_i32(self.game.ptr(engine.BASE + engine.GAME_DATA_MAN) + engine.NG_CYCLE,
                           self.ng_spin.get_value())
 
     def backup_saves(self):
-        import shutil
-        source = gamedata.BBPORT / "user/savedata"
+        install = bbport.find()
+        if not install:
+            raise engine.TrainerError(tr("bbport not found: pick it in the Game tab"))
+        source = bbport.user_dir(install) / "savedata"
         if not source.is_dir():
-            raise engine.TrainerError(f"nie widzę zapisów w {source}")
+            raise engine.TrainerError(tr("no saves found in {}").format(source))
         target = STATE_DIR / "saves" / time.strftime("%Y-%m-%d_%H-%M-%S")
-        shutil.copytree(source, target)
-        self.toast(f"Kopia: {target}")
+        shutil.copytree(source, target, dirs_exist_ok=True)
+        self.toast(tr("Backup: {}").format(target))
 
-    # ---------------------------------------------------------------- gra
+    # ---------------------------------------------------------------- the game
     def start_game(self):
         if engine.find_game_pids():
-            self.toast("Gra już działa. Trainer widzi tylko grę uruchomioną stąd.")
+            self.toast(tr("The game is already running."))
             return
-        launcher = gamedata.BBPORT / "launcher/bbport_launcher.py"
+        install = bbport.find()
+        if not install:
+            self.ask_bbport()
+            return
+        if install.kind == "appimage" and not os.access(install.path, os.X_OK):
+            self.alert(tr("The AppImage is not executable"),
+                       f"chmod +x \"{install.path}\"")
+            return
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        with open(GAME_LOG, "wb") as log:
-            self.child = subprocess.Popen([sys.executable, str(launcher), "--play"],
-                                          stdout=log, stderr=subprocess.STDOUT,
-                                          start_new_session=True)
-        self.toast("Uruchamiam grę…")
+        try:
+            with open(GAME_LOG, "wb") as log:
+                self.child = subprocess.Popen(install.command(), stdout=log,
+                                              stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as error:
+            self.alert(tr("Could not start the game"), str(error))
+            return
+        self.toast(tr("Starting the game…"))
+
+    def alert(self, heading, body):
+        dialog = Adw.AlertDialog(heading=heading, body=body)
+        dialog.add_response("ok", "OK")
+        dialog.present(self)
+
+    def ask_bbport(self):
+        dialog = Adw.AlertDialog(heading=tr("Where is bbport?"), body=tr(
+            "The trainer could not find bbport. Pick its AppImage, Bloodborne.sh, or the "
+            "folder with the source."))
+        dialog.add_response("cancel", tr("Cancel"))
+        dialog.add_response("folder", tr("Folder…"))
+        dialog.add_response("file", tr("AppImage or script…"))
+        dialog.set_response_appearance("file", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+
+        def answered(_dialog, answer):
+            if answer != "cancel":
+                self.start_after_choice = True
+                (self.pick_bbport_file if answer == "file" else self.pick_bbport_folder)()
+
+        dialog.connect("response", answered)
+        dialog.present(self)
 
     def report_start_failure(self):
         try:
             lines = GAME_LOG.read_text(errors="replace").strip().splitlines()
         except OSError:
             lines = []
-        text = "\n".join(lines[-6:]) or "brak komunikatu"
+        text = "\n".join(lines[-6:]) or tr("no message")
         if "cmake" in text:
-            text += "\n\nBrakuje programu cmake. Zainstaluj go:  sudo pacman -S cmake"
-        dialog = Adw.AlertDialog(heading="Gra się zamknęła z błędem",
-                                 body=f"{text}\n\nPełny log: {GAME_LOG}")
-        dialog.add_response("ok", "OK")
-        dialog.present(self)
+            text += "\n\n" + tr("bbport built from source needs cmake: install it with your "
+                                "package manager.")
+        self.alert(tr("The game closed with an error"),
+                   text + "\n\n" + tr("Full log: {}").format(GAME_LOG))
 
     def reap(self):
         if self.child and self.child.poll() is not None:
@@ -629,13 +786,13 @@ class Window(Adw.ApplicationWindow):
                 self.report_start_failure()
             self.child = None
         elif not self.child:
-            try:  # osierocone procesy gry (jesteśmy ich subreaperem)
+            try:  # orphaned game processes (we are their subreaper)
                 while os.waitpid(-1, os.WNOHANG)[0]:
                     pass
             except ChildProcessError:
                 pass
 
-    # ---------------------------------------------------------------- pętla
+    # ---------------------------------------------------------------- the loop
     def fire(self, name):
         self.run(getattr(self, name))
 
@@ -675,6 +832,8 @@ class Window(Adw.ApplicationWindow):
             elif key in self.game.forced:
                 self.game.set_flag(key, False)
         self.game.set_speed(self.speed.get_value())
+        if self.hitboxes.get_active() or self.game.hitboxes:
+            self.game.set_hitboxes(self.hitboxes.get_active())
         in_world = self.game.in_world()
         self.finish_forced_spawn(in_world)
 
@@ -693,7 +852,7 @@ class Window(Adw.ApplicationWindow):
             self.frozen.clear()
             self.item_counts.clear()
             if slow:
-                self.hp_row.set_subtitle("poza światem gry")
+                self.hp_row.set_subtitle(tr("not in the game world"))
             return
         player = self.game.player()
         data = self.game.chr_data(player)
