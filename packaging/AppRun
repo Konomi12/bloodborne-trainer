@@ -1,0 +1,56 @@
+#!/bin/sh
+# Starts the trainer with the Python, GTK 4 and libadwaita bundled in the AppImage.
+#   bb-trainer.AppImage [--play]           the trainer
+#   bb-trainer.AppImage --install [--desktop] | --uninstall   menu entry for this AppImage
+HERE="$(dirname "$(readlink -f "$0")")"
+U="$HERE/usr"
+
+# Variables changed below. The originals are kept so the game starts with the user's own
+# environment (see bbport.child_env).
+VARS="LD_LIBRARY_PATH PYTHONHOME PYTHONPATH PYTHONNOUSERSITE PYTHONDONTWRITEBYTECODE GI_TYPELIB_PATH XDG_DATA_DIRS GSETTINGS_SCHEMA_DIR GDK_PIXBUF_MODULE_FILE GDK_PIXBUF_MODULEDIR FONTCONFIG_FILE GDK_DISABLE"
+for v in $VARS; do
+    eval "if [ -n \"\${$v+x}\" ]; then export BB_TRAINER_SAVED_$v=\"\$$v\"; fi"
+done
+export BB_TRAINER_VARS="$VARS"
+
+RUN="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/bb-trainer-$(id -u)-$(basename "$HERE")"
+mkdir -p "$RUN"
+
+# gdk-pixbuf's loader list has absolute paths: point it at this mount
+sed "s|@APPDIR_USR@|$U|g" "$U/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache.in" > "$RUN/loaders.cache"
+
+# The system's fonts and font settings
+cat > "$RUN/fonts.conf" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <dir>/usr/share/fonts</dir>
+  <dir>/usr/local/share/fonts</dir>
+  <dir prefix="xdg">fonts</dir>
+  <dir>~/.fonts</dir>
+  <cachedir prefix="xdg">fontconfig</cachedir>
+  <include ignore_missing="yes">/etc/fonts/conf.d</include>
+</fontconfig>
+EOF
+
+unset PYTHONHOME PYTHONPATH
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+export LD_LIBRARY_PATH="$U/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export GI_TYPELIB_PATH="$U/lib/girepository-1.0"
+export XDG_DATA_DIRS="$U/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export GSETTINGS_SCHEMA_DIR="$U/share/glib-2.0/schemas"
+export GDK_PIXBUF_MODULEDIR="$U/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+export GDK_PIXBUF_MODULE_FILE="$RUN/loaders.cache"
+export FONTCONFIG_FILE="$RUN/fonts.conf"
+# Software rendering: the bundled libraries never meet the system's GPU drivers.
+# BB_TRAINER_GL=1 turns OpenGL/Vulkan back on.
+if [ -z "$BB_TRAINER_GL" ]; then
+    export GDK_DISABLE="${GDK_DISABLE:+$GDK_DISABLE,}gl,vulkan"
+fi
+
+case "$1" in
+    --install) shift; exec "$U/bin/python3" "$U/share/bb-trainer/install.py" "$@" ;;
+    --uninstall) exec "$U/bin/python3" "$U/share/bb-trainer/install.py" --uninstall ;;
+esac
+exec "$U/bin/python3" "$U/share/bb-trainer/trainer.py" "$@"

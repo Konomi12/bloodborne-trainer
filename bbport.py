@@ -5,6 +5,7 @@ and the source tree. All three are started with --play, which skips the launcher
 """
 import os
 import shlex
+import shutil
 import sys
 from pathlib import Path
 
@@ -27,13 +28,39 @@ class Install:
             return [str(self.path), "--play"]
         if self.kind == "folder":
             return [str(self.path / "Bloodborne.sh"), "--play"]
-        return [sys.executable, str(self.path / "launcher/bbport_launcher.py"), "--play"]
+        return [python(), str(self.path / "launcher/bbport_launcher.py"), "--play"]
 
     def data_dir(self):
         """Where bbport keeps bbport.ini and (unless moved) the saves."""
         if os.environ.get("BB_DATA_DIR"):
             return Path(os.environ["BB_DATA_DIR"])
         return self.path if self.kind == "source" else config.DATA_HOME / "bbport"
+
+
+def in_appimage():
+    """True when the trainer runs from its AppImage (the bundled Python and GTK)."""
+    return "BB_TRAINER_VARS" in os.environ
+
+
+def python():
+    """The Python for bbport's source tree: the system's, not the one bundled in the AppImage."""
+    if in_appimage():
+        return shutil.which("python3", path=child_env().get("PATH")) or "python3"
+    return sys.executable
+
+
+def child_env():
+    """The environment for programs the trainer starts, without what its AppImage set up."""
+    env = dict(os.environ)
+    for name in env.pop("BB_TRAINER_VARS", "").split():
+        saved = env.pop("BB_TRAINER_SAVED_" + name, None)
+        if saved is None:
+            env.pop(name, None)
+        else:
+            env[name] = saved
+    for name in ("APPDIR", "APPIMAGE", "ARGV0", "OWD"):
+        env.pop(name, None)
+    return env
 
 
 def identify(path):

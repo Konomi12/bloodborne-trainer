@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bloodborne Trainer
+Comment=Practice trainer for Bloodborne (bbport)
+Comment[pl]=Trainer do ćwiczenia w Bloodborne (bbport)
+Exec=bb-trainer
+Icon=bb-trainer
+Terminal=false
+Categories=Game;
+StartupWMClass=io.github.bbtrainer

@@ -5,6 +5,7 @@
     ./install.py --desktop    also an icon on the desktop
     ./install.py --uninstall  removes both
 """
+import os
 import re
 import sys
 from pathlib import Path
@@ -25,6 +26,13 @@ def quote(argument):
     return '"' + escaped.replace("\\", "\\\\").replace("%", "%%") + '"'
 
 
+def command():
+    """The trainer itself: the AppImage file when run from it, else Python and trainer.py."""
+    if bbport.in_appimage() and os.environ.get("APPIMAGE"):
+        return quote(os.environ["APPIMAGE"])
+    return f"{quote(sys.executable)} {quote(str(HERE / 'trainer.py'))}"
+
+
 def entry():
     icon = config.DATA_HOME / "icons/hicolor/256x256/apps/bbport.png"
     return ("[Desktop Entry]\n"
@@ -32,7 +40,7 @@ def entry():
             "Name=Bloodborne Trainer\n"
             "Comment=Practice trainer for Bloodborne (bbport)\n"
             "Comment[pl]=Trainer do ćwiczenia w Bloodborne (bbport)\n"
-            f"Exec={quote(sys.executable)} {quote(str(HERE / 'trainer.py'))}\n"
+            f"Exec={command()}\n"
             f"Icon={icon if icon.is_file() else 'applications-games'}\n"
             "Terminal=false\n"
             "Categories=Game;\n"
@@ -68,7 +76,8 @@ def main(arguments):
     found = bbport.find()
     print(f"bbport found: {found.path}" if found
           else "bbport not found yet: the trainer asks for it when you press Start game.")
-    print("Keep this folder where it is: the shortcut points to it.")
+    print("Keep the AppImage where it is: the shortcut points to it." if bbport.in_appimage()
+          else "Keep this folder where it is: the shortcut points to it.")
     return 0
 
 
