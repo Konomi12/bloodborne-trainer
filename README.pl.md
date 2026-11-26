@@ -41,3 +41,6 @@ Pad: Select/View + krzyżak (góra zapisz, dół wczytaj, lewo ulecz, prawo warp
 - Zmiany w statach, itemach i flagach bossów zostają w zapisie.
 - Nie używać w grze online.
 - Zamknięcie trainera wyłącza cheaty i oddaje grze oryginalny kod.
+
+## Licencja
+[GPL-2.0-or-later](LICENSE), taka jak bbporta. Bez gwarancji.

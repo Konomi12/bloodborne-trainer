@@ -107,3 +107,6 @@ New interface languages go into `i18n.py`.
   [Bloodborne-save-editor](https://github.com/Noxde/Bloodborne-save-editor) by Noxde.
 
 Unofficial fan tool, not affiliated with FromSoftware or Sony.
+
+## License
+[GPL-2.0-or-later](LICENSE), the same as bbport. No warranty.
